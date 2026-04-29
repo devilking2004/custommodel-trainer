@@ -1,0 +1,241 @@
+import csv
+import json
+import re
+from io import StringIO
+from pathlib import Path
+
+from sqlalchemy.orm import Session
+
+from app.models.custom_model import CustomModel
+from app.models.dataset import Dataset
+from app.models.enums import DatasetStatus, FileKind, ModelCategory
+from app.models.model_version import ModelVersion
+from app.models.stored_file import StoredFile
+from app.models.training_job import TrainingJob
+from app.services.storage import download_bytes
+
+
+def _normalize_text(value: object) -> str:
+    if value is None:
+        return ""
+
+    text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip('"').strip("'").strip()
+    return text.casefold()
+
+
+def _clean_output(value: object) -> str:
+    if value is None:
+        return ""
+
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _decode_text_dataset(file: StoredFile) -> str:
+    data = download_bytes(file.storage_key)
+    return data.decode("utf-8-sig")
+
+
+def _parse_text_dataset_file(file: StoredFile) -> list[tuple[str, str]]:
+    text = _decode_text_dataset(file)
+    suffix = Path(file.original_filename).suffix.lower()
+
+    examples: list[tuple[str, str]] = []
+
+    if suffix == ".csv":
+        reader = csv.DictReader(StringIO(text))
+
+        if not reader.fieldnames:
+            return []
+
+        fieldnames = [field.strip() for field in reader.fieldnames]
+
+        if "input" not in fieldnames or "output" not in fieldnames:
+            return []
+
+        for row in reader:
+            input_value = _clean_output(row.get("input"))
+            output_value = _clean_output(row.get("output"))
+
+            if input_value and output_value:
+                examples.append((input_value, output_value))
+
+        return examples
+
+    if suffix == ".jsonl":
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            input_value = _clean_output(row.get("input"))
+            output_value = _clean_output(row.get("output"))
+
+            if input_value and output_value:
+                examples.append((input_value, output_value))
+
+        return examples
+
+    return []
+
+
+def _get_version_dataset(
+    db: Session,
+    model: CustomModel,
+    version: ModelVersion | None,
+) -> Dataset | None:
+    if not version or not version.training_job_id:
+        return None
+
+    job = (
+        db.query(TrainingJob)
+        .filter(
+            TrainingJob.id == version.training_job_id,
+            TrainingJob.model_id == model.id,
+        )
+        .first()
+    )
+
+    if not job or not job.dataset_id:
+        return None
+
+    return (
+        db.query(Dataset)
+        .filter(
+            Dataset.id == job.dataset_id,
+            Dataset.model_id == model.id,
+        )
+        .first()
+    )
+
+
+def _get_candidate_datasets(
+    db: Session,
+    model: CustomModel,
+    version: ModelVersion | None,
+) -> list[Dataset]:
+    datasets: list[Dataset] = []
+
+    version_dataset = _get_version_dataset(db, model, version)
+
+    if version_dataset:
+        datasets.append(version_dataset)
+
+    ready_datasets = (
+        db.query(Dataset)
+        .filter(
+            Dataset.model_id == model.id,
+            Dataset.status == DatasetStatus.READY,
+        )
+        .order_by(Dataset.updated_at.desc())
+        .all()
+    )
+
+    existing_ids = {dataset.id for dataset in datasets}
+
+    for dataset in ready_datasets:
+        if dataset.id not in existing_ids:
+            datasets.append(dataset)
+
+    if datasets:
+        return datasets
+
+    return (
+        db.query(Dataset)
+        .filter(Dataset.model_id == model.id)
+        .order_by(Dataset.updated_at.desc())
+        .all()
+    )
+
+
+def _get_dataset_files(db: Session, dataset: Dataset) -> list[StoredFile]:
+    return (
+        db.query(StoredFile)
+        .filter(
+            StoredFile.dataset_id == dataset.id,
+            StoredFile.kind == FileKind.TEXT_DATASET,
+        )
+        .order_by(StoredFile.created_at.asc())
+        .all()
+    )
+
+
+def _lookup_text_to_text_dataset(
+    db: Session,
+    model: CustomModel,
+    version: ModelVersion | None,
+    input_text: str,
+) -> str | None:
+    datasets = _get_candidate_datasets(db, model, version)
+
+    if not datasets:
+        return None
+
+    target = _normalize_text(input_text)
+
+    parsed_files: list[list[tuple[str, str]]] = []
+
+    for dataset in datasets:
+        for file in _get_dataset_files(db, dataset):
+            try:
+                parsed_files.append(_parse_text_dataset_file(file))
+            except Exception:
+                continue
+
+    # 1. Exact normalized match.
+    for examples in parsed_files:
+        for example_input, example_output in examples:
+            if _normalize_text(example_input) == target:
+                return example_output
+
+    # 2. Contains match.
+    # Example: "Suggest nicknames for Subhash Kumar" matches "Subhash Kumar".
+    for examples in parsed_files:
+        for example_input, example_output in examples:
+            normalized_example = _normalize_text(example_input)
+
+            if normalized_example and normalized_example in target:
+                return example_output
+
+    # 3. Reverse contains match.
+    # Example: "Subhash" may match "Subhash Kumar".
+    for examples in parsed_files:
+        for example_input, example_output in examples:
+            normalized_example = _normalize_text(example_input)
+
+            if target and target in normalized_example:
+                return example_output
+
+    return None
+
+
+def run_model_inference(
+    db: Session,
+    model: CustomModel,
+    version: ModelVersion | None,
+    input_text: str,
+) -> str | dict:
+    if model.category == ModelCategory.TEXT_TO_TEXT:
+        dataset_output = _lookup_text_to_text_dataset(db, model, version, input_text)
+
+        if dataset_output:
+            return dataset_output
+
+        suffix = f" using {version.name}" if version else " using draft model"
+
+        return (
+            f"No dataset match found for: {input_text[:500]}. "
+            f"Mock fallback response{suffix}. "
+            f"Try an exact input from your training CSV, such as 'Subhash Kumar' or 'Priya Patel'."
+        )
+
+    return {
+        "image_url": "https://placehold.co/1024x1024/png?text=Mock+Generated+Image",
+        "prompt": input_text,
+        "note": "This is a mock response. Connect Diffusers/LoRA inference later.",
+    }

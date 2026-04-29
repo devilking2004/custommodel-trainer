@@ -1,0 +1,91 @@
+services:
+  api:
+    build: .
+    container_name: custommodel-api
+    env_file:
+      - .env
+    environment:
+      RUN_MIGRATIONS: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+
+  worker:
+    build: .
+    container_name: custommodel-worker
+    env_file:
+      - .env
+    environment:
+      RUN_MIGRATIONS: "false"
+    command: ["python", "-m", "app.workers.worker"]
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: custommodel-postgres
+    environment:
+      POSTGRES_USER: custommodel
+      POSTGRES_PASSWORD: custommodel
+      POSTGRES_DB: custommodel
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U custommodel -d custommodel"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: custommodel-redis
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: custommodel-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  create-bucket:
+    image: minio/mc:latest
+    container_name: custommodel-create-bucket
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb -p local/custommodel-trainer || true;
+      mc anonymous set download local/custommodel-trainer || true;
+      exit 0;
+      "
+
+volumes:
+  postgres-data:
+  minio-data:

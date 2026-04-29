@@ -1,0 +1,101 @@
+﻿services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: custommodel_postgres
+    env_file: .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: custommodel_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: custommodel_minio
+    env_file: .env
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  create-bucket:
+    image: minio/mc:latest
+    container_name: custommodel_create_bucket
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb -p local/custommodel-trainer || true;
+      mc anonymous set download local/custommodel-trainer || true;
+      exit 0;
+      "
+
+  api:
+    build:
+      context: ./apps/api
+    container_name: custommodel_api
+    env_file: .env
+    environment:
+      RUN_MIGRATIONS: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      create-bucket:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: ./apps/api
+    container_name: custommodel_worker
+    env_file: .env
+    environment:
+      RUN_MIGRATIONS: "false"
+    command: ["python", "-m", "app.workers.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      create-bucket:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: ./apps/web
+    container_name: custommodel_web
+    env_file: .env
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  minio_data:
